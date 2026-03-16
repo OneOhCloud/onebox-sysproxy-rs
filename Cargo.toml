@@ -1,6 +1,6 @@
 [package]
 name = "onebox-sysproxy-rs"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 license = "MIT"
 description = "A cross-platform library for getting/setting system proxy. Supports Windows, macOS and Linux."
