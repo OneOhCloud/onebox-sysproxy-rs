@@ -6,11 +6,17 @@
 //! - Enumerates all RAS (dial-up/VPN) connections via `RasEnumEntriesW` and applies proxy to each
 //! - Three-tier propagation: set options → notify changes → refresh
 
-use crate::{Autoproxy, Result, Sysproxy};
+use crate::{AppContainer, Autoproxy, Result, Sysproxy};
 use std::ffi::c_void;
 use std::mem::{ManuallyDrop, size_of, zeroed};
 use url::Url;
+use windows::Win32::Foundation::{HLOCAL, LocalFree, WIN32_ERROR};
 use windows::Win32::NetworkManagement::Rras::{RASENTRYNAMEW, RasEnumEntriesW};
+use windows::Win32::NetworkManagement::WindowsFirewall::{
+    INET_FIREWALL_APP_CONTAINER, NetworkIsolationEnumAppContainers,
+    NetworkIsolationFreeAppContainers, NetworkIsolationGetAppContainerConfig,
+    NetworkIsolationSetAppContainerConfig,
+};
 use windows::Win32::Networking::WinInet::{
     INTERNET_OPTION_PER_CONNECTION_OPTION, INTERNET_OPTION_PROXY_SETTINGS_CHANGED,
     INTERNET_OPTION_REFRESH, INTERNET_PER_CONN, INTERNET_PER_CONN_AUTOCONFIG_URL,
@@ -19,7 +25,9 @@ use windows::Win32::Networking::WinInet::{
     INTERNET_PER_CONN_PROXY_SERVER, InternetQueryOptionW, InternetSetOptionW,
     PROXY_TYPE_AUTO_DETECT, PROXY_TYPE_AUTO_PROXY_URL, PROXY_TYPE_DIRECT, PROXY_TYPE_PROXY,
 };
-use windows::core::PWSTR;
+use windows::Win32::Security::Authorization::{ConvertSidToStringSidW, ConvertStringSidToSidW};
+use windows::Win32::Security::{PSID, SID, SID_AND_ATTRIBUTES};
+use windows::core::{PCWSTR, PWSTR};
 
 /// Win32 ERROR_BUFFER_TOO_SMALL (122)
 const ERROR_BUFFER_TOO_SMALL: u32 = 122;
@@ -113,9 +121,8 @@ fn apply(options: &INTERNET_PER_CONN_OPTION_LISTW) -> Result<()> {
             return Ok(());
         }
 
-        for i in 0..entries as usize {
-            // Extract connection name as a mutable wide string
-            let name = &ras_entries[i].szEntryName;
+        for entry in ras_entries.iter().take(entries as usize) {
+            let name = &entry.szEntryName;
             let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
             let mut wide_name: Vec<u16> = name[..len].to_vec();
             wide_name.push(0);
@@ -332,10 +339,10 @@ fn parse_host_port(address: &str) -> (String, u16) {
     }
 
     // Fallback to manual splitting
-    if let Some((h, p)) = address.rsplit_once(':') {
-        if let Ok(port) = p.parse::<u16>() {
-            return (h.to_string(), port);
-        }
+    if let Some((h, p)) = address.rsplit_once(':')
+        && let Ok(port) = p.parse::<u16>()
+    {
+        return (h.to_string(), port);
     }
 
     (address.to_string(), 0)
@@ -387,5 +394,118 @@ impl Autoproxy {
         } else {
             unset_proxy()
         }
+    }
+}
+
+// ── UWP loopback proxy exemption ─────────────────────────────────────────────
+
+/// Convert a `*mut SID` to its `S-1-…` string representation.
+///
+/// The string buffer is allocated by `ConvertSidToStringSidW` and freed here.
+///
+/// # Safety
+/// `sid` must be a valid SID pointer or null.
+unsafe fn sid_to_string(sid: *mut SID) -> Option<String> {
+    if sid.is_null() {
+        return None;
+    }
+    let mut pwstr = PWSTR::null();
+    unsafe { ConvertSidToStringSidW(PSID(sid as *mut c_void), &mut pwstr) }.ok()?;
+    if pwstr.is_null() {
+        return None;
+    }
+    let s = unsafe { from_wide(pwstr) };
+    let _ = unsafe { LocalFree(Some(HLOCAL(pwstr.as_ptr() as *mut c_void))) };
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// Parse a SID string into an allocated `PSID`.
+///
+/// # Safety
+/// The caller must free the returned pointer with `LocalFree`.
+unsafe fn string_to_psid(s: &str) -> Option<PSID> {
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut psid = PSID::default();
+    unsafe { ConvertStringSidToSidW(PCWSTR::from_raw(wide.as_ptr()), &mut psid) }.ok()?;
+    if psid.0.is_null() { None } else { Some(psid) }
+}
+
+/// Returns all installed UWP app containers with their current exemption status.
+pub(crate) fn get_uwp_exemption() -> Result<Vec<AppContainer>> {
+    unsafe {
+        // Collect currently-exempted SIDs into a set for O(1) lookup.
+        let mut ex_count: u32 = 0;
+        let mut sids_ptr: *mut SID_AND_ATTRIBUTES = std::ptr::null_mut();
+
+        WIN32_ERROR(NetworkIsolationGetAppContainerConfig(
+            &mut ex_count,
+            &mut sids_ptr,
+        ))
+        .ok()?;
+
+        let mut exempted: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(ex_count as usize);
+
+        if ex_count > 0 && !sids_ptr.is_null() {
+            let sids = std::slice::from_raw_parts(sids_ptr, ex_count as usize);
+            for sa in sids {
+                if let Some(s) = sid_to_string(sa.Sid.0 as *mut SID) {
+                    exempted.insert(s);
+                }
+            }
+            let _ = LocalFree(Some(HLOCAL(sids_ptr as *mut c_void)));
+        }
+
+        // Enumerate all containers and annotate with exemption status.
+        let mut count: u32 = 0;
+        let mut ptr: *mut INET_FIREWALL_APP_CONTAINER = std::ptr::null_mut();
+
+        let ret = NetworkIsolationEnumAppContainers(0, &mut count, &mut ptr);
+        if WIN32_ERROR(ret).is_err() || ptr.is_null() || count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let containers = std::slice::from_raw_parts(ptr, count as usize);
+        let mut result = Vec::with_capacity(count as usize);
+
+        for c in containers {
+            let Some(sid) = sid_to_string(c.appContainerSid) else {
+                continue;
+            };
+            let exempted = exempted.contains(&sid);
+            result.push(AppContainer {
+                exempted,
+                sid,
+                name: from_wide(c.appContainerName),
+                display_name: from_wide(c.displayName),
+            });
+        }
+
+        NetworkIsolationFreeAppContainers(ptr);
+        Ok(result)
+    }
+}
+
+/// Replaces the UWP loopback proxy exemption list and returns the updated list.
+pub(crate) fn set_uwp_exemption(sids: &[String]) -> Result<Vec<AppContainer>> {
+    unsafe {
+        let psids: Vec<PSID> = sids.iter().filter_map(|s| string_to_psid(s)).collect();
+        let sa_list: Vec<SID_AND_ATTRIBUTES> = psids
+            .iter()
+            .map(|&sid| SID_AND_ATTRIBUTES {
+                Sid: sid,
+                Attributes: 0,
+            })
+            .collect();
+
+        let set_result = WIN32_ERROR(NetworkIsolationSetAppContainerConfig(&sa_list)).ok();
+
+        // Free PSIDs allocated by ConvertStringSidToSidW
+        for psid in &psids {
+            let _ = LocalFree(Some(HLOCAL(psid.0)));
+        }
+
+        set_result?;
+        get_uwp_exemption()
     }
 }

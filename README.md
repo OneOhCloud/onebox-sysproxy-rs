@@ -6,7 +6,7 @@
 
 | 平台 | 实现方式 | 特点 |
 |---|---|---|
-| **Windows** | WinINet API + RAS 枚举 | 三层通知（设置→通知→刷新）；枚举所有拨号/VPN 连接逐一设置；`INTERNET_PER_CONN_FLAGS_UI` 兼容 Win7+，自动 fallback 旧版 |
+| **Windows** | WinINet API + RAS 枚举 | 三层通知（设置→通知→刷新）；枚举所有拨号/VPN 连接逐一设置；`INTERNET_PER_CONN_FLAGS_UI` 兼容 Win7+，自动 fallback 旧版；支持 UWP 应用 loopback 代理豁免管理 |
 | **macOS** | `networksetup` 命令 | 自动检测活跃网络服务；支持 HTTP/HTTPS/SOCKS 代理 |
 | **Linux** | `gsettings` / `kreadconfig` | 同时支持 GNOME 和 KDE 桌面环境 |
 
@@ -48,6 +48,12 @@ sysproxy pac http://127.0.0.1:1080/proxy.pac
 
 # 关闭代理（恢复直连）
 sysproxy off
+
+# 导出 UWP 豁免列表到 uwp_exemption.json（仅 Windows）
+sysproxy uwp-get
+
+# 从 uwp_exemption.json 应用 UWP 豁免列表（仅 Windows）
+sysproxy uwp-set
 ```
 
 ## 命令行参考
@@ -96,6 +102,42 @@ sysproxy off
 ### `sysproxy off`
 
 关闭系统代理，恢复为直连模式。
+
+### `sysproxy uwp-get`（仅 Windows）
+
+将所有已安装的 UWP 应用容器及其当前豁免状态导出到当前目录的 `uwp_exemption.json`。
+
+输出示例：
+```json
+[
+  {
+    "sid": "S-1-15-2-...",
+    "name": "microsoft.microsoftedge_8wekyb3d8bbwe",
+    "display_name": "Microsoft Edge",
+    "exempted": false
+  },
+  {
+    "sid": "S-1-15-2-...",
+    "name": "microsoft.windowscommunicationsapps_8wekyb3d8bbwe",
+    "display_name": "Mail and Calendar",
+    "exempted": true
+  }
+]
+```
+
+### `sysproxy uwp-set`（仅 Windows）
+
+从当前目录的 `uwp_exemption.json` 读取列表，将 `"exempted": true` 的条目设置为系统 loopback 代理豁免。
+
+典型工作流：
+
+```bash
+sysproxy uwp-get          # 导出完整列表
+# 编辑 uwp_exemption.json，将需要豁免的应用改为 "exempted": true
+sysproxy uwp-set          # 应用
+```
+
+> **说明：** UWP 应用默认被沙箱隔离，无法连接 loopback 地址（如 `127.0.0.1`）。loopback 豁免允许这些应用通过本地代理客户端访问网络。
 
 ### `sysproxy set <flags> [server] [bypass] [pac_url]`
 
@@ -194,18 +236,45 @@ pub struct Autoproxy {
     pub enable: bool,     // 是否启用
     pub url: String,      // PAC 文件 URL
 }
+
+/// UWP 应用容器（仅 Windows）
+#[cfg(target_os = "windows")]
+pub struct AppContainer {
+    pub sid: String,           // AppContainer SID（S-1-15-2-…）
+    pub name: String,          // 包名（如 microsoft.microsoftedge_8wekyb3d8bbwe）
+    pub display_name: String,  // 显示名称
+    pub exempted: bool,        // 是否在 loopback 代理豁免列表中
+}
 ```
 
 ### 方法
 
-| 方法 | 说明 |
-|---|---|
-| `Sysproxy::get_system_proxy()` | 获取当前系统代理设置 |
-| `Sysproxy::set_system_proxy(&self)` | 设置系统代理 |
-| `Sysproxy::is_support()` | 当前平台是否支持 |
-| `Autoproxy::get_auto_proxy()` | 获取当前 PAC 设置 |
-| `Autoproxy::set_auto_proxy(&self)` | 设置 PAC 自动代理 |
-| `Autoproxy::is_support()` | 当前平台是否支持 |
+| 方法 | 平台 | 说明 |
+|---|---|---|
+| `Sysproxy::get_system_proxy()` | 全平台 | 获取当前系统代理设置 |
+| `Sysproxy::set_system_proxy(&self)` | 全平台 | 设置系统代理 |
+| `Sysproxy::is_support()` | 全平台 | 当前平台是否支持 |
+| `Autoproxy::get_auto_proxy()` | 全平台 | 获取当前 PAC 设置 |
+| `Autoproxy::set_auto_proxy(&self)` | 全平台 | 设置 PAC 自动代理 |
+| `Autoproxy::is_support()` | 全平台 | 当前平台是否支持 |
+| `AppContainer::get_exemption()` | Windows | 获取所有 UWP 应用及当前豁免状态 |
+| `AppContainer::set_exemption(&[String])` | Windows | 按 SID 列表设置 loopback 豁免，返回更新后的完整列表 |
+
+### UWP 豁免 API 示例（仅 Windows）
+
+```rust
+use onebox_sysproxy_rs::AppContainer;
+
+// 获取所有 UWP 应用及豁免状态
+let apps = AppContainer::get_exemption().unwrap();
+for app in &apps {
+    println!("[{}] {} ({})", if app.exempted { "x" } else { " " }, app.display_name, app.sid);
+}
+
+// 将指定 SID 设为豁免
+let sids = vec!["S-1-15-2-...".to_string()];
+let updated = AppContainer::set_exemption(&sids).unwrap();
+```
 
 ## Makefile 命令
 
@@ -247,9 +316,9 @@ make TARGET=x86_64-unknown-linux-gnu
 
 ```
 src/
-├── lib.rs       # 公共接口（Sysproxy, Autoproxy, Error）
+├── lib.rs       # 公共接口（Sysproxy, Autoproxy, AppContainer, Error）
 ├── main.rs      # CLI 二进制入口
-├── windows.rs   # Windows 实现（WinINet + RAS）
+├── windows.rs   # Windows 实现（WinINet + RAS + UWP loopback 豁免）
 ├── macos.rs     # macOS 实现（networksetup）
 ├── linux.rs     # Linux 实现（gsettings / kreadconfig）
 └── utils.rs     # 工具函数（CIDR → wildcard 转换）

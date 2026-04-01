@@ -55,6 +55,37 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Represents a UWP app container that can be exempted from proxy loopback restrictions.
+///
+/// Windows UWP apps are sandboxed and cannot reach loopback addresses by default.
+/// Loopback exemption allows them to connect through a local proxy.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AppContainer {
+    /// AppContainer SID string (e.g. `S-1-15-2-…`).
+    pub sid: String,
+    /// Internal package name (e.g. `microsoft.windowscommunicationsapps_8wekyb3d8bbwe`).
+    pub name: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Whether this container is currently in the loopback proxy exemption list.
+    pub exempted: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl AppContainer {
+    /// Returns the current UWP loopback proxy exemption list.
+    pub fn get_exemption() -> Result<Vec<AppContainer>> {
+        crate::windows::get_uwp_exemption()
+    }
+
+    /// Replaces the UWP loopback proxy exemption list with the given SID strings
+    /// and returns the updated list.
+    pub fn set_exemption(sids: &[String]) -> Result<Vec<AppContainer>> {
+        crate::windows::set_uwp_exemption(sids)
+    }
+}
+
 impl Sysproxy {
     /// Returns `true` if the current platform is supported.
     pub fn is_support() -> bool {

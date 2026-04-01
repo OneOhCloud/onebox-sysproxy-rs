@@ -26,3 +26,5 @@ target
 todo.md
 
 .DS_Store
+sysproxy.exe
+uwp_exemption.json

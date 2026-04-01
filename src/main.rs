@@ -2,6 +2,10 @@ use clap::{Parser, Subcommand};
 use onebox_sysproxy_rs::{Autoproxy, Sysproxy};
 use std::process::ExitCode;
 
+/// Fixed filename for UWP exemption import/export.
+#[cfg(target_os = "windows")]
+const UWP_EXEMPTION_FILE: &str = "uwp_exemption.json";
+
 /// Cross-platform system proxy configuration tool.
 ///
 /// Supports setting/getting HTTP proxy and PAC auto-proxy on Windows, macOS and Linux.
@@ -38,6 +42,14 @@ enum Commands {
 
     /// Disable system proxy (set to direct connection)
     Off,
+
+    /// Export current UWP loopback proxy exemption list to uwp_exemption.json (Windows only)
+    #[cfg(target_os = "windows")]
+    UwpGet,
+
+    /// Apply UWP loopback proxy exemption list from uwp_exemption.json (Windows only)
+    #[cfg(target_os = "windows")]
+    UwpSet,
 
     /// Low-level set with explicit flags (advanced).
     ///
@@ -141,7 +153,7 @@ fn run(cmd: Commands) -> onebox_sysproxy_rs::Result<()> {
             bypass,
             pac_url,
         } => {
-            if flags > 15 || flags < 1 {
+            if !(1..=15).contains(&flags) {
                 return Err(onebox_sysproxy_rs::Error::ParseStr(format!(
                     "flags must be 1-15, got {flags}"
                 )));
@@ -207,6 +219,30 @@ fn run(cmd: Commands) -> onebox_sysproxy_rs::Result<()> {
             }
 
             println!("Proxy settings applied (flags={flags})");
+        }
+
+        #[cfg(target_os = "windows")]
+        Commands::UwpGet => {
+            let list = onebox_sysproxy_rs::AppContainer::get_exemption()?;
+            let json = serde_json::to_string_pretty(&list)
+                .map_err(|e| onebox_sysproxy_rs::Error::ParseStr(e.to_string()))?;
+            std::fs::write(UWP_EXEMPTION_FILE, &json)?;
+            println!("Wrote {} entries to {UWP_EXEMPTION_FILE}", list.len());
+        }
+
+        #[cfg(target_os = "windows")]
+        Commands::UwpSet => {
+            let content = std::fs::read_to_string(UWP_EXEMPTION_FILE)?;
+            let entries: Vec<onebox_sysproxy_rs::AppContainer> = serde_json::from_str(&content)
+                .map_err(|e| onebox_sysproxy_rs::Error::ParseStr(e.to_string()))?;
+            let sids: Vec<String> = entries
+                .into_iter()
+                .filter(|c| c.exempted)
+                .map(|c| c.sid)
+                .collect();
+            let updated = onebox_sysproxy_rs::AppContainer::set_exemption(&sids)?;
+            let applied = updated.iter().filter(|c| c.exempted).count();
+            println!("Applied {applied} UWP exemptions");
         }
     }
 
