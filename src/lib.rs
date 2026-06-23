@@ -14,6 +14,12 @@ mod windows;
 
 pub mod utils;
 
+/// Resolve the active network service name / clear a proxy by host. Exposed so
+/// consumers that drive `networksetup` for other settings (e.g. DNS) can reuse
+/// the same device→service resolution instead of re-deriving it.
+#[cfg(target_os = "macos")]
+pub use macos::{active_network_service, clear_proxy};
+
 /// Represents a system HTTP/SOCKS proxy configuration.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Sysproxy {
@@ -43,6 +49,9 @@ pub enum Error {
 
     #[error("failed to set proxy for this environment")]
     NotSupport,
+
+    #[error("{0}")]
+    Command(String),
 
     #[cfg(target_os = "linux")]
     #[error(transparent)]

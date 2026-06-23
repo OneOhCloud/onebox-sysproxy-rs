@@ -1,38 +1,232 @@
 use crate::{Autoproxy, Error, Result, Sysproxy};
 use log::debug;
-use std::net::{SocketAddr, UdpSocket};
-use std::{process::Command, str::from_utf8};
+use std::process::Command;
+use std::str::from_utf8;
+
+// ---------------------------------------------------------------------------
+// networksetup command wrapper
+// ---------------------------------------------------------------------------
+
+/// Run a `networksetup` subcommand, returning its stdout on success.
+///
+/// `networksetup` writes its diagnostics (e.g. "** Error: The parameters were
+/// not valid.") to **stdout**, not stderr, and exits non-zero. Earlier code
+/// ignored the exit status and parsed stdout regardless, so a bad service name
+/// surfaced as a misleading `failed to parse string \`port\`` instead of the
+/// real reason. We check the status and surface both streams.
+fn run_networksetup(args: &[&str]) -> Result<String> {
+    let out = Command::new("networksetup").args(args).output()?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail: Vec<&str> = [stdout.trim(), stderr.trim()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect();
+        return Err(Error::Command(format!(
+            "networksetup {:?} exited {:?}: {}",
+            args,
+            out.status.code(),
+            detail.join(" | ")
+        )));
+    }
+    Ok(stdout.into_owned())
+}
+
+// ---------------------------------------------------------------------------
+// Active network service resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve the active default-route interface to its `networksetup` **service**
+/// name (e.g. `Wi-Fi`, or whatever the user renamed it to).
+///
+/// `route -n get default` gives the BSD device; `-listnetworkserviceorder`
+/// maps device → service name. The service name — not the hardware-port label
+/// from `-listallhardwareports` — is the only token `networksetup` accepts.
+/// The two coincide only for an unrenamed built-in adapter; they diverge when
+/// a service is renamed, when the OS auto-creates a "<name> 2", and for USB
+/// adapters whose hardware port is "Ethernet Adapter (enX)" while the service
+/// carries its own name. Feeding the hardware-port label to `-setwebproxy` /
+/// `-setdnsservers` then fails with exit 4 / exit 8 on such machines.
+///
+/// Offline-safe: uses the routing table, not a UDP probe to a public IP.
+pub fn active_network_service() -> Result<String> {
+    let iface = default_route_interface()?;
+    let order = run_networksetup(&["-listnetworkserviceorder"])?;
+    service_for_device(&order, &iface)
+        .ok_or_else(|| Error::Command(format!("no network service maps to interface {iface}")))
+}
+
+fn default_route_interface() -> Result<String> {
+    let out = Command::new("route").args(["-n", "get", "default"]).output()?;
+    let stdout = from_utf8(&out.stdout).or(Err(Error::ParseStr("route".into())))?;
+    stdout
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("interface:")
+                .map(|s| s.trim().to_string())
+        })
+        .ok_or(Error::NetworkInterface)
+}
+
+/// Map a BSD device (`en0`) to its network service name by parsing
+/// `networksetup -listnetworkserviceorder`. Pure string work, unit-tested.
+/// The format is paired lines:
+///
+/// ```text
+/// (3) Wi-Fi
+/// (Hardware Port: Wi-Fi, Device: en0)
+/// ```
+///
+/// A disabled service uses `(*)` in place of the index; the device cell can be
+/// empty (e.g. Tailscale), which must never match a real interface.
+fn service_for_device(serviceorder: &str, device: &str) -> Option<String> {
+    let mut pending: Option<String> = None;
+    for line in serviceorder.lines().map(str::trim) {
+        if let Some(detail) = line.strip_prefix("(Hardware Port:") {
+            let dev = detail
+                .rsplit("Device:")
+                .next()
+                .map(|d| d.trim_end_matches(')').trim())
+                .unwrap_or("");
+            if !dev.is_empty() && dev == device && let Some(service) = pending.take() {
+                return Some(service);
+            }
+            pending = None;
+        } else if line.starts_with('(') {
+            // Service header: "(N) Name" or "(*) Name". The index paren is
+            // always first, so taking everything past it preserves a service
+            // name that itself contains parentheses.
+            pending = line.find(')').map(|c| line[c + 1..].trim().to_string());
+        }
+    }
+    None
+}
+
+/// Active service, falling back to the first listed service when the default
+/// route can't be resolved (e.g. offline during shutdown).
+fn resolve_service() -> Result<String> {
+    active_network_service().or_else(|e| {
+        debug!("route-based service detection failed: {e:?}; falling back to first service");
+        first_network_service()
+    })
+}
+
+fn first_network_service() -> Result<String> {
+    let out = run_networksetup(&["-listallnetworkservices"])?;
+    out.lines()
+        .nth(1)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .ok_or(Error::NetworkInterface)
+}
+
+/// Enabled network services (skips the header tip line and `*`-prefixed
+/// disabled services). Every returned name is a valid `networksetup` argument.
+fn list_all_services() -> Result<Vec<String>> {
+    let out = run_networksetup(&["-listallnetworkservices"])?;
+    Ok(out
+        .lines()
+        .skip(1)
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('*'))
+        .map(ToString::to_string)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Proxy get/set
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+enum ProxyType {
+    Http,
+    Https,
+    Socks,
+}
+
+impl ProxyType {
+    fn target(self) -> &'static str {
+        match self {
+            ProxyType::Http => "webproxy",
+            ProxyType::Https => "securewebproxy",
+            ProxyType::Socks => "socksfirewallproxy",
+        }
+    }
+}
+
+fn get_proxy(proxy_type: ProxyType, service: &str) -> Result<Sysproxy> {
+    let target = format!("-get{}", proxy_type.target());
+    let stdout = run_networksetup(&[target.as_str(), service])?;
+    let enable = parse(&stdout, "Enabled:") == "Yes";
+    let host = parse(&stdout, "Server:").to_string();
+    // On valid output Port is always numeric ("0" when unset); only reachable
+    // because run_networksetup already rejected error stdout via exit status.
+    let port = parse(&stdout, "Port:").parse().unwrap_or(0);
+    Ok(Sysproxy {
+        enable,
+        host,
+        port,
+        bypass: String::new(),
+    })
+}
+
+fn set_proxy(proxy: &Sysproxy, proxy_type: ProxyType, service: &str) -> Result<()> {
+    let set_target = format!("-set{}", proxy_type.target());
+    let port = proxy.port.to_string();
+    run_networksetup(&[set_target.as_str(), service, proxy.host.as_str(), port.as_str()])?;
+    set_proxy_state(proxy_type, service, proxy.enable)
+}
+
+fn set_proxy_state(proxy_type: ProxyType, service: &str, enable: bool) -> Result<()> {
+    let target = format!("-set{}state", proxy_type.target());
+    run_networksetup(&[target.as_str(), service, if enable { "on" } else { "off" }])?;
+    Ok(())
+}
+
+fn get_bypass(service: &str) -> Result<String> {
+    let stdout = run_networksetup(&["-getproxybypassdomains", service])?;
+    Ok(stdout
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(","))
+}
+
+/// Disable the system proxy on **every** service whose configured proxy server
+/// matches `host`. Clears a proxy the caller set even if the active interface
+/// changed since it was applied (e.g. Wi-Fi → Ethernet), avoiding a stale proxy
+/// left behind on the previously-active service.
+pub fn clear_proxy(host: &str) -> Result<()> {
+    for service in list_all_services()? {
+        for kind in [ProxyType::Http, ProxyType::Https, ProxyType::Socks] {
+            let current = get_proxy(kind, &service)?;
+            if current.enable && current.host == host {
+                set_proxy_state(kind, &service, false)?;
+            }
+        }
+    }
+    Ok(())
+}
 
 impl Sysproxy {
-    /// Gets the current system proxy settings.
+    /// Gets the current system proxy settings on the active service.
     pub fn get_system_proxy() -> Result<Sysproxy> {
-        let service = default_network_service().or_else(|e| {
-            debug!("Failed to get network service: {:?}", e);
-            default_network_service_by_ns()
-        })?;
-        let service = service.as_str();
+        let service = resolve_service()?;
 
-        let mut socks = Sysproxy::get_socks(service)?;
-        debug!("Getting SOCKS proxy: {:?}", socks);
-
-        let http = Sysproxy::get_http(service)?;
-        debug!("Getting HTTP proxy: {:?}", http);
-
-        let https = Sysproxy::get_https(service)?;
-        debug!("Getting HTTPS proxy: {:?}", https);
-
-        let bypass = Sysproxy::get_bypass(service)?;
-        debug!("Getting bypass domains: {:?}", bypass);
-
-        socks.bypass = bypass;
+        let mut socks = get_proxy(ProxyType::Socks, &service)?;
+        let http = get_proxy(ProxyType::Http, &service)?;
+        let https = get_proxy(ProxyType::Https, &service)?;
+        socks.bypass = get_bypass(&service)?;
 
         if !socks.enable {
             if http.enable {
                 socks.enable = true;
                 socks.host = http.host;
                 socks.port = http.port;
-            }
-            if https.enable {
+            } else if https.enable {
                 socks.enable = true;
                 socks.host = https.host;
                 socks.port = https.port;
@@ -42,27 +236,15 @@ impl Sysproxy {
         Ok(socks)
     }
 
-    /// Sets the system proxy.
+    /// Sets the system proxy on the active service. Returns an error if any
+    /// `networksetup` call fails (e.g. an unresolvable service), so callers
+    /// fail fast instead of believing a silently-rejected proxy was applied.
     pub fn set_system_proxy(&self) -> Result<()> {
-        let service = default_network_service().or_else(|e| {
-            debug!("Failed to get network service: {:?}", e);
-            default_network_service_by_ns()
-        })?;
-        let service = service.as_str();
-
-        debug!("Use network service: {}", service);
-
-        debug!("Setting SOCKS proxy");
-        self.set_socks(service)?;
-
-        debug!("Setting HTTP proxy");
-        self.set_https(service)?;
-
-        debug!("Setting HTTPS proxy");
-        self.set_http(service)?;
-
-        debug!("Setting bypass domains");
-        self.set_bypass(service)?;
+        let service = resolve_service()?;
+        set_proxy(self, ProxyType::Socks, &service)?;
+        set_proxy(self, ProxyType::Http, &service)?;
+        set_proxy(self, ProxyType::Https, &service)?;
+        self.set_bypass(&service)?;
         Ok(())
     }
 
@@ -79,18 +261,7 @@ impl Sysproxy {
     }
 
     pub fn get_bypass(service: &str) -> Result<String> {
-        let bypass_output = Command::new("networksetup")
-            .args(["-getproxybypassdomains", service])
-            .output()?;
-
-        let bypass = from_utf8(&bypass_output.stdout)
-            .or(Err(Error::ParseStr("bypass".into())))?
-            .split('\n')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<&str>>()
-            .join(",");
-
-        Ok(bypass)
+        get_bypass(service)
     }
 
     pub fn set_http(&self, service: &str) -> Result<()> {
@@ -106,36 +277,27 @@ impl Sysproxy {
     }
 
     pub fn set_bypass(&self, service: &str) -> Result<()> {
-        let domains = self.bypass.split(",").collect::<Vec<_>>();
-        networksetup()
-            .args([["-setproxybypassdomains", service].to_vec(), domains].concat())
-            .status()?;
+        let domains: Vec<&str> = self.bypass.split(',').filter(|s| !s.is_empty()).collect();
+        let mut args = vec!["-setproxybypassdomains", service];
+        args.extend(domains);
+        run_networksetup(&args)?;
         Ok(())
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auto-proxy (PAC)
+// ---------------------------------------------------------------------------
+
 impl Autoproxy {
     /// Gets the current auto-proxy (PAC) settings.
     pub fn get_auto_proxy() -> Result<Autoproxy> {
-        let service = default_network_service().or_else(|e| {
-            debug!("Failed to get network service: {:?}", e);
-            default_network_service_by_ns()
-        })?;
-        let service = service.as_str();
-
-        let auto_output = networksetup()
-            .args(["-getautoproxyurl", service])
-            .output()?;
-        let auto = from_utf8(&auto_output.stdout)
-            .or(Err(Error::ParseStr("auto".into())))?
-            .trim()
-            .split_once('\n')
-            .ok_or(Error::ParseStr("auto".into()))?;
-        let url = strip_str(auto.0.strip_prefix("URL: ").unwrap_or(""));
-        // macOS networksetup returns "(null)" when no PAC URL is configured
+        let service = resolve_service()?;
+        let stdout = run_networksetup(&["-getautoproxyurl", &service])?;
+        let enable = parse(&stdout, "Enabled:") == "Yes";
+        let url = strip_str(parse(&stdout, "URL:"));
+        // macOS returns "(null)" when no PAC URL is configured.
         let url = if url == "(null)" { "" } else { url };
-        let enable = auto.1 == "Enabled: Yes";
-
         Ok(Autoproxy {
             enable,
             url: url.to_string(),
@@ -144,99 +306,32 @@ impl Autoproxy {
 
     /// Sets the auto-proxy (PAC) configuration.
     pub fn set_auto_proxy(&self) -> Result<()> {
-        let service = default_network_service().or_else(|e| {
-            debug!("Failed to get network service: {:?}", e);
-            default_network_service_by_ns()
-        })?;
-        let service = service.as_str();
-
-        let enable = if self.enable { "on" } else { "off" };
+        let service = resolve_service()?;
         let url = if self.url.is_empty() {
             "\"\""
         } else {
-            &self.url
+            self.url.as_str()
         };
-        networksetup()
-            .args(["-setautoproxyurl", service, url])
-            .status()?;
-        networksetup()
-            .args(["-setautoproxystate", service, enable])
-            .status()?;
-
+        run_networksetup(&["-setautoproxyurl", &service, url])?;
+        run_networksetup(&[
+            "-setautoproxystate",
+            &service,
+            if self.enable { "on" } else { "off" },
+        ])?;
         Ok(())
     }
 }
 
-#[derive(Debug)]
-enum ProxyType {
-    Http,
-    Https,
-    Socks,
-}
+// ---------------------------------------------------------------------------
+// Parsing helpers
+// ---------------------------------------------------------------------------
 
-impl ProxyType {
-    fn to_target(&self) -> &'static str {
-        match self {
-            ProxyType::Http => "webproxy",
-            ProxyType::Https => "securewebproxy",
-            ProxyType::Socks => "socksfirewallproxy",
-        }
-    }
-}
-
-fn networksetup() -> Command {
-    Command::new("networksetup")
-}
-
-fn set_proxy(proxy: &Sysproxy, proxy_type: ProxyType, service: &str) -> Result<()> {
-    let target = format!("-set{}", proxy_type.to_target());
-    let port = format!("{}", proxy.port);
-
-    networksetup()
-        .args([target.as_str(), service, proxy.host.as_str(), port.as_str()])
-        .status()?;
-
-    let target_state = format!("-set{}state", proxy_type.to_target());
-    let enable = if proxy.enable { "on" } else { "off" };
-
-    networksetup()
-        .args([target_state.as_str(), service, enable])
-        .status()?;
-
-    Ok(())
-}
-
-fn get_proxy(proxy_type: ProxyType, service: &str) -> Result<Sysproxy> {
-    let target = format!("-get{}", proxy_type.to_target());
-
-    let output = networksetup().args([target.as_str(), service]).output()?;
-
-    let stdout = from_utf8(&output.stdout).or(Err(Error::ParseStr("output".into())))?;
-    let enable = parse(stdout, "Enabled:");
-    let enable = enable == "Yes";
-
-    let host = parse(stdout, "Server:").to_string();
-
-    let port = parse(stdout, "Port:");
-    let port = port.parse().or(Err(Error::ParseStr("port".into())))?;
-
-    Ok(Sysproxy {
-        enable,
-        host,
-        port,
-        bypass: String::new(),
-    })
-}
-
-fn parse<'a>(target: &'a str, key: &'a str) -> &'a str {
-    match target.find(key) {
+/// Return the trimmed value following `key` on its line (`""` if absent).
+fn parse<'a>(text: &'a str, key: &str) -> &'a str {
+    match text.find(key) {
         Some(idx) => {
-            let idx = idx + key.len();
-            let value = &target[idx..];
-            let value = match value.find("\n") {
-                Some(end) => &value[..end],
-                None => value,
-            };
+            let rest = &text[idx + key.len()..];
+            let value = rest.split('\n').next().unwrap_or(rest);
             value.trim()
         }
         None => "",
@@ -245,96 +340,69 @@ fn parse<'a>(target: &'a str, key: &'a str) -> &'a str {
 
 fn strip_str(text: &str) -> &str {
     text.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
         .unwrap_or(text)
-        .strip_suffix('"')
-        .unwrap_or(text)
 }
 
-fn default_network_service() -> Result<String> {
-    let socket = UdpSocket::bind("0.0.0.0:0")?;
-    socket.connect("1.1.1.1:80")?;
-    let ip = socket.local_addr()?.ip();
-    let addr = SocketAddr::new(ip, 0);
+#[cfg(test)]
+mod tests {
+    use super::service_for_device;
 
-    let interfaces = interfaces::Interface::get_all().or(Err(Error::NetworkInterface))?;
-    let interface = interfaces
-        .into_iter()
-        .find(|i| i.addresses.iter().any(|a| a.addr == Some(addr)))
-        .map(|i| i.name.to_owned());
+    // Mirror of a real `-listnetworkserviceorder` dump: a USB ethernet whose
+    // service name ("AX88179A") differs from its hardware-port label, the
+    // built-in Wi-Fi, and a Tailscale service with an empty device cell.
+    const ORDER: &str = "An asterisk (*) denotes that a network service is disabled.\n\
+(1) AX88179A\n\
+(Hardware Port: AX88179A, Device: en6)\n\
+\n\
+(2) Thunderbolt Bridge\n\
+(Hardware Port: Thunderbolt Bridge, Device: bridge0)\n\
+\n\
+(3) Wi-Fi\n\
+(Hardware Port: Wi-Fi, Device: en0)\n\
+\n\
+(4) Tailscale\n\
+(Hardware Port: io.tailscale.ipn.macsys, Device: )\n";
 
-    match interface {
-        Some(interface) => {
-            let service = get_service_by_order(interface)?;
-            Ok(service)
-        }
-        None => Err(Error::NetworkInterface),
-    }
-}
-
-fn default_network_service_by_ns() -> Result<String> {
-    let output = networksetup().arg("-listallnetworkservices").output()?;
-    let stdout = from_utf8(&output.stdout).or(Err(Error::ParseStr("output".into())))?;
-    let mut lines = stdout.split('\n');
-    lines.next(); // ignore the tips
-
-    match lines.next() {
-        Some(line) => Ok(line.into()),
-        None => Err(Error::NetworkInterface),
-    }
-}
-
-fn get_service_by_order(device: String) -> Result<String> {
-    let services = listnetworkserviceorder()?;
-    let service = services
-        .into_iter()
-        .find(|(_, _, d)| d == &device)
-        .map(|(s, _, _)| s);
-    match service {
-        Some(service) => Ok(service),
-        None => Err(Error::NetworkInterface),
-    }
-}
-
-fn listnetworkserviceorder() -> Result<Vec<(String, String, String)>> {
-    let output = networksetup().arg("-listnetworkserviceorder").output()?;
-    let stdout = from_utf8(&output.stdout).or(Err(Error::ParseStr("output".into())))?;
-
-    let mut lines = stdout.split('\n');
-    lines.next(); // ignore the tips
-
-    let mut services = Vec::new();
-    let mut pending: Option<(String, String, String)> = None;
-
-    for line in lines {
-        if !line.starts_with("(") {
-            continue;
-        }
-
-        if pending.is_none() {
-            let ri = line.find(")");
-            if ri.is_none() {
-                continue;
-            }
-            let ri = ri.unwrap();
-            let service = line[ri + 1..].trim();
-            pending = Some((service.into(), String::new(), String::new()));
-        } else {
-            let line = &line[1..line.len() - 1];
-            let pi = line.find("Port:");
-            let di = line.find(", Device:");
-            if pi.is_none() || di.is_none() {
-                continue;
-            }
-            let pi = pi.unwrap();
-            let di = di.unwrap();
-            let port = line[pi + 5..di].trim();
-            let device = line[di + 9..].trim();
-            let (service, _, _) = pending.as_ref().unwrap();
-            let entry = (service.clone(), port.into(), device.into());
-            services.push(entry);
-            pending = None;
-        }
+    #[test]
+    fn maps_builtin_wifi_device_to_service() {
+        assert_eq!(service_for_device(ORDER, "en0").as_deref(), Some("Wi-Fi"));
     }
 
-    Ok(services)
+    #[test]
+    fn maps_usb_adapter_to_service_name_not_hardware_port() {
+        // `-listallhardwareports` labels this device "Ethernet Adapter (en6)";
+        // only the service name "AX88179A" works with networksetup. This is the
+        // case the old hardware-port lookup got wrong.
+        assert_eq!(service_for_device(ORDER, "en6").as_deref(), Some("AX88179A"));
+    }
+
+    #[test]
+    fn maps_renamed_wifi_service() {
+        // Hardware port stays "Wi-Fi" but the service was renamed, so
+        // `-setwebproxy "Wi-Fi"` / `-setdnsservers "Wi-Fi"` return exit 4/8.
+        let order = "An asterisk (*) denotes that a network service is disabled.\n\
+(1) 我的无线\n\
+(Hardware Port: Wi-Fi, Device: en0)\n";
+        assert_eq!(service_for_device(order, "en0").as_deref(), Some("我的无线"));
+    }
+
+    #[test]
+    fn empty_device_cell_never_matches() {
+        assert_eq!(service_for_device(ORDER, ""), None);
+    }
+
+    #[test]
+    fn unknown_device_returns_none() {
+        assert_eq!(service_for_device(ORDER, "en9"), None);
+    }
+
+    #[test]
+    fn service_name_with_parentheses_preserved() {
+        let order = "header\n(2) Home (5GHz)\n(Hardware Port: Wi-Fi, Device: en0)\n";
+        assert_eq!(
+            service_for_device(order, "en0").as_deref(),
+            Some("Home (5GHz)")
+        );
+    }
 }
