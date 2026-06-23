@@ -200,15 +200,34 @@ fn get_bypass(service: &str) -> Result<String> {
 /// changed since it was applied (e.g. Wi-Fi → Ethernet), avoiding a stale proxy
 /// left behind on the previously-active service.
 pub fn clear_proxy(host: &str) -> Result<()> {
+    // Best-effort across services: one failing service must not block clearing
+    // the rest, or a stale proxy could be left enabled on a service we never
+    // reached (exactly the broken-connectivity state this is meant to prevent).
+    // The first error is remembered and returned after attempting everything.
+    let mut first_err: Option<Error> = None;
     for service in list_all_services()? {
         for kind in [ProxyType::Http, ProxyType::Https, ProxyType::Socks] {
-            let current = get_proxy(kind, &service)?;
-            if current.enable && current.host == host {
-                set_proxy_state(kind, &service, false)?;
+            let current = match get_proxy(kind, &service) {
+                Ok(p) => p,
+                Err(e) => {
+                    debug!("clear_proxy: inspect [{service}] {} failed: {e}", kind.target());
+                    first_err.get_or_insert(e);
+                    continue;
+                }
+            };
+            if current.enable
+                && current.host == host
+                && let Err(e) = set_proxy_state(kind, &service, false)
+            {
+                debug!("clear_proxy: disable [{service}] {} failed: {e}", kind.target());
+                first_err.get_or_insert(e);
             }
         }
     }
-    Ok(())
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 impl Sysproxy {
@@ -221,12 +240,15 @@ impl Sysproxy {
         let https = get_proxy(ProxyType::Https, &service)?;
         socks.bypass = get_bypass(&service)?;
 
+        // SOCKS takes precedence when set; otherwise HTTP, then HTTPS overrides
+        // (two independent checks, matching the historical precedence).
         if !socks.enable {
             if http.enable {
                 socks.enable = true;
                 socks.host = http.host;
                 socks.port = http.port;
-            } else if https.enable {
+            }
+            if https.enable {
                 socks.enable = true;
                 socks.host = https.host;
                 socks.port = https.port;
@@ -236,11 +258,14 @@ impl Sysproxy {
         Ok(socks)
     }
 
-    /// Sets the system proxy on the active service. Returns an error if any
-    /// `networksetup` call fails (e.g. an unresolvable service), so callers
-    /// fail fast instead of believing a silently-rejected proxy was applied.
+    /// Sets the system proxy on the active service. Resolves strictly via
+    /// [`active_network_service`] (no first-service fallback): if the default
+    /// route can't be mapped to a service we error out rather than silently
+    /// applying the proxy to some unrelated service. Also returns an error if
+    /// any `networksetup` call fails, so callers fail fast instead of believing
+    /// a silently-rejected proxy was applied.
     pub fn set_system_proxy(&self) -> Result<()> {
-        let service = resolve_service()?;
+        let service = active_network_service()?;
         set_proxy(self, ProxyType::Socks, &service)?;
         set_proxy(self, ProxyType::Http, &service)?;
         set_proxy(self, ProxyType::Https, &service)?;
@@ -279,7 +304,13 @@ impl Sysproxy {
     pub fn set_bypass(&self, service: &str) -> Result<()> {
         let domains: Vec<&str> = self.bypass.split(',').filter(|s| !s.is_empty()).collect();
         let mut args = vec!["-setproxybypassdomains", service];
-        args.extend(domains);
+        if domains.is_empty() {
+            // networksetup requires at least one argument; a single empty string
+            // clears the bypass list (preserves the pre-v0.0.2 behaviour).
+            args.push("");
+        } else {
+            args.extend(domains);
+        }
         run_networksetup(&args)?;
         Ok(())
     }
